@@ -6,18 +6,57 @@
 #include <iostream>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
-#include <boost/beast/version.hpp>
 #include <boost/asio/dispatch.hpp>
 #include <boost/asio/strand.hpp>
-#include <boost/config.hpp>
+#include <boost/asio/ssl.hpp>
 
 namespace beast = boost::beast;
 namespace http = beast::http;
 namespace net = boost::asio;
+namespace ssl = net::ssl;
 using tcp = boost::asio::ip::tcp;
 
 template<class... Ts>
 struct overloads : Ts... { using Ts::operator()...; };
+
+struct RuntimeOptions
+{
+};
+
+class Client
+{
+    net::io_context &ioc_;
+    tcp::resolver resolver_;
+
+public:
+    [[nodiscard]] http::response<http::dynamic_body> Request(std::string_view host, std::string_view path)
+    {
+        ssl::context ctx{ssl::context::tlsv12_client};
+        ctx.set_verify_mode(ssl::verify_peer);
+
+        ssl::stream<beast::tcp_stream> stream{this->ioc_, ctx};
+
+        auto const resolved_host = this->resolver_.resolve(host, std::string_view{"443"});
+        beast::get_lowest_layer(stream).connect(resolved_host);
+
+        stream.handshake(ssl::stream_base::client);
+
+        http::request<http::string_body> req{http::verb::get, path, 11};
+        http::write(stream, req);
+
+        beast::flat_buffer buffer;
+        http::response<http::dynamic_body> res;
+        http::read(stream, buffer, res);
+
+        std::cout << res << std::endl;
+
+        stream.shutdown();
+
+        return res;
+    }
+
+    Client(net::io_context &ioc) : ioc_(ioc), resolver_(ioc) {}
+};
 
 using Response = http::message_generator;
 using Request = http::request<http::string_body>;
@@ -129,16 +168,28 @@ public:
 };
 
 RestProvider WebCtlRestProvider{
+    // Request Logging
     Middleware{ "/", [](Request &req) -> std::optional<Response> {
         std::cout << "[Server] Received request to " << req.target() << std::endl;
         return std::nullopt;
     }},
 
+    // Authentication
     Middleware{ "/", [](Request &req) -> std::optional<Response> {
-        /* PERFORM AUTHENTICATION */
+        auto res_unauthorized = http::response<http::empty_body>{http::status::unauthorized, req.version()};
+
+        auto auth_header = req.find(http::field::authorization);
+        if (auth_header == req.end())
+        {
+            return res_unauthorized;
+        }
+
+        auto token = auth_header->value();
+
         return std::nullopt;
     }},
 
+    // Routes
     Node{ http::verb::get, "/info", [](Request const &req) -> Response {
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.body() = "v0.0.1";
@@ -260,6 +311,9 @@ public:
 int main()
 {
     net::io_context ioc;
+
+    Client client{ioc};
+    client.Request("cognito-idp.us-east-1.amazonaws.com", "/us-east-1_zLcMyB1HE/.well-known/jwks.json");
 
     auto server = std::make_shared<Server>(ioc);
     server->Run();

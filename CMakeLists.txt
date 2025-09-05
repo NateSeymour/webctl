@@ -5,11 +5,8 @@ set(CMAKE_CXX_STANDARD 23)
 
 include(cmake/CPM.cmake)
 
+find_package(OpenSSL REQUIRED)
 CPMAddPackage("gh:boostorg/boost#boost-1.89.0")
-CPMAddPackage(
-        URI "gh:aws/aws-sdk-cpp#1.11.640"
-        OPTIONS "BUILD_ONLY cognito-idp"
-)
 
 add_executable(webctl src/main.cpp)
-target_link_libraries(webctl PUBLIC Boost::beast Boost::asio)
+target_link_libraries(webctl PUBLIC Boost::beast Boost::asio openssl)
