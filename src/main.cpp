@@ -149,6 +149,18 @@ class JWKSProvider
     }
 
 public:
+    [[nodiscard]] std::optional<json::value> GetKeyById(const std::string& kid)
+    {
+        std::lock_guard lk(this->m_jwks_);
+
+        if (this->jwks_.keys.contains(kid))
+        {
+            return this->jwks_.keys.at(kid);
+        }
+
+        return std::nullopt;
+    }
+
     JWKSProvider(asio::io_context &ioc, HTTPClient &http_client) : ioc_(ioc), http_client_(http_client)
     {
         std::cout << "[JWKSProvider] Initializing..." << std::endl;
@@ -160,42 +172,49 @@ public:
 using Response = http::message_generator;
 using Request = http::request<http::string_body>;
 
+template<typename ContextType>
 struct Route
 {
-    using HandlerFunctionType = Response(*)(Request const&);
+    using HandlerFunctionType = Response(*)(ContextType &, Request const&);
 
     http::verb method;
     char const *path;
     HandlerFunctionType handler_function;
 };
 
+template<typename ContextType>
 struct Middleware
 {
-    using MiddlewareFunctionType = std::optional<Response>(*)(Request&);
+    using MiddlewareFunctionType = std::optional<Response>(*)(ContextType &, Request&);
 
     char const *path;
     MiddlewareFunctionType middleware_function;
 };
 
-using Handler = std::variant<Route, Middleware>;
-using RestDescription = std::initializer_list<Handler>;
+template<typename ContextType>
+using Handler = std::variant<Route<ContextType>, Middleware<ContextType>>;
 
+template<typename ContextType>
+using RestDescription = std::initializer_list<Handler<ContextType>>;
+
+template<typename ContextType>
 struct HandlerTree
 {
-    std::vector<Handler> handlers;
+    std::vector<Handler<ContextType>> handlers;
     std::unordered_map<std::string, HandlerTree> children;
 };
 
+template<typename ContextType>
 class RestProvider
 {
-    HandlerTree handlers_;
+    HandlerTree<ContextType> handlers_;
 
 public:
-    [[nodiscard]] Response RespondTo(Request &req)
+    [[nodiscard]] Response Handle(ContextType &ctx, Request &req)
     {
         auto path = req.target();
 
-        HandlerTree *tree = &this->handlers_;
+        HandlerTree<ContextType> *tree = &this->handlers_;
         for (auto const part : std::views::split(path, std::string_view{"/"}))
         {
             if (!part.empty())
@@ -205,10 +224,10 @@ public:
 
             for (auto const &handler : tree->handlers)
             {
-                if (std::holds_alternative<Middleware>(handler))
+                if (std::holds_alternative<Middleware<ContextType>>(handler))
                 {
-                    auto middleware = std::get<Middleware>(handler);
-                    auto res = middleware.middleware_function(req);
+                    auto middleware = std::get<Middleware<ContextType>>(handler);
+                    auto res = middleware.middleware_function(ctx, req);
 
                     if (res)
                     {
@@ -218,16 +237,16 @@ public:
             }
         }
 
-        auto const it = std::ranges::find_if(tree->handlers, [&](Handler &handler) {
-            if (std::holds_alternative<Middleware>(handler)) return false;
-            auto const &node = std::get<Route>(handler);
+        auto const it = std::ranges::find_if(tree->handlers, [&](Handler<ContextType> &handler) {
+            if (std::holds_alternative<Middleware<ContextType>>(handler)) return false;
+            auto const &node = std::get<Route<ContextType>>(handler);
 
             return (path == node.path && req.method() == node.method);
         });
 
         if (it != tree->handlers.end())
         {
-            return std::get<Route>(*it).handler_function(req);
+            return std::get<Route<ContextType>>(*it).handler_function(ctx, req);
         }
 
         auto res = http::response<http::string_body>{http::status::not_found, req.version()};
@@ -239,20 +258,20 @@ public:
      *
      * @param description Description of REST routes to build Provider from.
      */
-    RestProvider(RestDescription const &description)
+    RestProvider(RestDescription<ContextType> const &description)
     {
         for (auto const &handler : description)
         {
             std::string path = std::visit(overload{
-                [](Route const &node) {
+                [](Route<ContextType> const &node) {
                     return node.path;
                 },
-                [](Middleware const &middleware) {
+                [](Middleware<ContextType> const &middleware) {
                     return middleware.path;
                 }
             }, handler);
 
-            HandlerTree *tree = &this->handlers_;
+            HandlerTree<ContextType> *tree = &this->handlers_;
             for (auto const part : std::views::split(path.substr(1), std::string_view{"/"}))
             {
                 if (part.empty()) continue;
@@ -265,11 +284,13 @@ public:
     }
 };
 
+template<typename RestContextType>
 class Server
 {
     asio::io_context &ioc_;
 
-    RestProvider &rest_provider_;
+    RestContextType &rest_ctx_;
+    RestProvider<RestContextType> &rest_provider_;
 
     asio::ip::address addr_ = asio::ip::make_address("0.0.0.0");
     unsigned short port_ = 6969;
@@ -285,7 +306,7 @@ class Server
         stream.expires_after(std::chrono::seconds(30));
         co_await http::async_read(stream, buffer, req);
 
-        auto res = this->rest_provider_.RespondTo(req);
+        auto res = this->rest_provider_.Handle(this->rest_ctx_, req);
 
         co_await beast::async_write(stream, std::move(res));
 
@@ -330,7 +351,7 @@ class Server
     }
 
 public:
-    Server(asio::io_context &ioc, RestProvider &rest_provider) : ioc_(ioc), acceptor_(asio::make_strand(ioc)), rest_provider_(rest_provider)
+    Server(asio::io_context &ioc, RestProvider<RestContextType> &rest_provider, RestContextType &rest_ctx) : ioc_(ioc), acceptor_(asio::make_strand(ioc)), rest_provider_(rest_provider), rest_ctx_(rest_ctx)
     {
         std::cout << "[Server] Initializing..." << std::endl;
 
@@ -343,15 +364,20 @@ public:
     }
 };
 
-RestProvider web_ctl_rest_provider{
+struct WebCtlContext
+{
+    JWKSProvider &jwks_provider;
+};
+
+RestProvider<WebCtlContext> web_ctl_rest_provider{
     // Request Logging
-    Middleware{ "/", [](Request &req) -> std::optional<Response> {
+    Middleware<WebCtlContext>{ "/", [](WebCtlContext &ctx, Request &req) -> std::optional<Response> {
         std::cout << "[Server] Received request to " << req.target() << std::endl;
         return std::nullopt;
     }},
 
     // Authentication
-    Middleware{ "/", [](Request &req) -> std::optional<Response> {
+    Middleware<WebCtlContext>{ "/", [](WebCtlContext &ctx, Request &req) -> std::optional<Response> {
         auto res_unauthorized = http::response<http::empty_body>{http::status::unauthorized, req.version()};
 
         auto auth_header = req.find(http::field::authorization);
@@ -366,7 +392,7 @@ RestProvider web_ctl_rest_provider{
     }},
 
     // Routes
-    Route{ http::verb::get, "/info", [](Request const &req) -> Response {
+    Route<WebCtlContext>{ http::verb::get, "/info", [](WebCtlContext &ctx, Request const &req) -> Response {
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.body() = "v0.0.1";
 
@@ -386,7 +412,11 @@ int main(int argc, char const **argv)
 
     HTTPClient client{ioc, ca_string};
     JWKSProvider jwks_provider{ioc, client};
-    Server server{ioc, web_ctl_rest_provider};
+
+    WebCtlContext webctl_ctx{
+        .jwks_provider = jwks_provider,
+    };
+    Server server{ioc, web_ctl_rest_provider, webctl_ctx};
 
     // Launch threads
     std::size_t thread_count = std::thread::hardware_concurrency();
