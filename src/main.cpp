@@ -4,64 +4,163 @@
 #include <optional>
 #include <ranges>
 #include <iostream>
+#include <fstream>
+#include <thread>
+#include <vector>
+#include <mutex>
 #include <boost/beast/core.hpp>
 #include <boost/beast/http.hpp>
-#include <boost/asio/dispatch.hpp>
+#include <boost/beast/version.hpp>
 #include <boost/asio/strand.hpp>
 #include <boost/asio/ssl.hpp>
+#include <boost/asio/co_spawn.hpp>
+#include <boost/asio/use_future.hpp>
+#include <boost/asio/as_tuple.hpp>
+#include <boost/asio/detached.hpp>
+#include <boost/url.hpp>
+#include <boost/json.hpp>
 
 namespace beast = boost::beast;
 namespace http = beast::http;
-namespace net = boost::asio;
-namespace ssl = net::ssl;
-using tcp = boost::asio::ip::tcp;
+namespace asio = boost::asio;
+namespace ssl = asio::ssl;
+namespace json = boost::json;
+using tcp = asio::ip::tcp;
+
+/*
+ * Helper for std::visit provided by Andreas Fertig.
+ * https://andreasfertig.blog/2023/07/visiting-a-stdvariant-safely/
+ */
+template<class...>
+constexpr bool always_false_v = false;
 
 template<class... Ts>
-struct overloads : Ts... { using Ts::operator()...; };
-
-struct RuntimeOptions
+struct overload : Ts...
 {
+    using Ts::operator()...;
+
+    template<typename T>
+    constexpr void operator()(T) const
+    {
+        static_assert(always_false_v<T>, "Unsupported type");
+    }
 };
 
-class Client
+template<class... Ts>
+overload(Ts...) -> overload<Ts...>;
+
+class HTTPClient
 {
-    net::io_context &ioc_;
-    tcp::resolver resolver_;
+    asio::io_context &ioc_;
+    ssl::context ssl_ctx_;
 
 public:
-    [[nodiscard]] http::response<http::dynamic_body> Request(std::string_view host, std::string_view path)
+    asio::awaitable<http::response<http::dynamic_body>> RequestAsync(boost::url url)
     {
-        ssl::context ctx{ssl::context::tlsv12_client};
-        ctx.set_verify_mode(ssl::verify_peer);
+        auto executor = co_await asio::this_coro::executor;
 
-        ssl::stream<beast::tcp_stream> stream{this->ioc_, ctx};
+        tcp::resolver resolver{executor};
+        ssl::stream<beast::tcp_stream> stream{executor, this->ssl_ctx_};
 
-        auto const resolved_host = this->resolver_.resolve(host, std::string_view{"443"});
-        beast::get_lowest_layer(stream).connect(resolved_host);
+        auto const resolved_host = co_await resolver.async_resolve(url.host(), "443");
+        co_await beast::get_lowest_layer(stream).async_connect(resolved_host);
 
-        stream.handshake(ssl::stream_base::client);
+        co_await stream.async_handshake(ssl::stream_base::client);
 
-        http::request<http::string_body> req{http::verb::get, path, 11};
-        http::write(stream, req);
+        http::request<http::string_body> req{http::verb::get, url.path(), 11};
+        req.set(http::field::host, url.host());
+        req.set(http::field::user_agent, BOOST_BEAST_VERSION_STRING);
+
+        co_await http::async_write(stream, req);
 
         beast::flat_buffer buffer;
         http::response<http::dynamic_body> res;
-        http::read(stream, buffer, res);
+        co_await http::async_read(stream, buffer, res);
 
-        std::cout << res << std::endl;
+        auto [ec] = co_await stream.async_shutdown(asio::as_tuple);
+        if(ec != ssl::error::stream_truncated)
+        {
+            throw beast::system_error{ec};
+        }
 
-        stream.shutdown();
-
-        return res;
+        co_return res;
     }
 
-    Client(net::io_context &ioc) : ioc_(ioc), resolver_(ioc) {}
+    HTTPClient(asio::io_context &ioc, std::string_view ca_certs) : ioc_(ioc), ssl_ctx_(ssl::context::tlsv12_client)
+    {
+        std::cout << "[Client] Initializing..." << std::endl;
+
+        this->ssl_ctx_.set_verify_mode(ssl::verify_peer);
+        this->ssl_ctx_.add_certificate_authority(asio::buffer(ca_certs.data(), ca_certs.size()));
+    }
+};
+
+struct JWKS
+{
+    std::unordered_map<std::string, json::value> keys;
+
+    [[nodiscard]] static std::optional<JWKS> FromJson(json::value raw)
+    {
+        JWKS jwks;
+
+        auto &keys = raw.as_object()["keys"];
+        for (auto &key : keys.as_array())
+        {
+            auto &kid = key.as_object()["kid"].as_string();
+
+            jwks.keys[std::string{kid}] = key;
+        }
+
+        return std::move(jwks);
+    }
+};
+
+class JWKSProvider
+{
+    asio::io_context &ioc_;
+    HTTPClient &http_client_;
+
+    JWKS jwks_;
+    std::mutex m_jwks_;
+
+    asio::awaitable<void> FetchJWKS()
+    {
+        while (true)
+        {
+            std::cout << "[JWKSProvider] Fetching latest JWKS..." << std::endl;
+            auto res = co_await this->http_client_.RequestAsync(boost::url{"https://cognito-idp.us-east-1.amazonaws.com/us-east-1_zLcMyB1HE/.well-known/jwks.json"});
+
+            json::value jwks = json::parse(beast::buffers_to_string(res.body().data()));
+
+            {
+                std::lock_guard lk(this->m_jwks_);
+
+                this->jwks_ = JWKS::FromJson(jwks).value();
+
+                std::cout << "[JWKSProvider] Fetched latest JWKS. " << this->jwks_.keys.size() << " keys loaded:" << std::endl;
+                for (auto const &[id, key] : this->jwks_.keys)
+                {
+                    std::cout << "[JWKSProvider] - " << id << std::endl;
+                }
+            }
+
+            co_await asio::steady_timer{this->ioc_, std::chrono::minutes(10)}.async_wait();
+        }
+    }
+
+public:
+    JWKSProvider(asio::io_context &ioc, HTTPClient &http_client) : ioc_(ioc), http_client_(http_client)
+    {
+        std::cout << "[JWKSProvider] Initializing..." << std::endl;
+
+        asio::co_spawn(this->ioc_, this->FetchJWKS(), asio::detached);
+    }
 };
 
 using Response = http::message_generator;
 using Request = http::request<http::string_body>;
 
-struct Node
+struct Route
 {
     using HandlerFunctionType = Response(*)(Request const&);
 
@@ -78,8 +177,7 @@ struct Middleware
     MiddlewareFunctionType middleware_function;
 };
 
-using Handler = std::variant<Node, Middleware>;
-
+using Handler = std::variant<Route, Middleware>;
 using RestDescription = std::initializer_list<Handler>;
 
 struct HandlerTree
@@ -102,7 +200,7 @@ public:
         {
             if (!part.empty())
             {
-                tree = tree = &tree->children[std::string{part.begin(), part.end()}];
+                tree = &tree->children[std::string{part.begin(), part.end()}];
             }
 
             for (auto const &handler : tree->handlers)
@@ -122,14 +220,14 @@ public:
 
         auto const it = std::ranges::find_if(tree->handlers, [&](Handler &handler) {
             if (std::holds_alternative<Middleware>(handler)) return false;
-            auto const &node = std::get<Node>(handler);
+            auto const &node = std::get<Route>(handler);
 
             return (path == node.path && req.method() == node.method);
         });
 
         if (it != tree->handlers.end())
         {
-            return std::get<Node>(*it).handler_function(req);
+            return std::get<Route>(*it).handler_function(req);
         }
 
         auto res = http::response<http::string_body>{http::status::not_found, req.version()};
@@ -145,8 +243,8 @@ public:
     {
         for (auto const &handler : description)
         {
-            std::string path = std::visit(overloads{
-                [](Node const &node) {
+            std::string path = std::visit(overload{
+                [](Route const &node) {
                     return node.path;
                 },
                 [](Middleware const &middleware) {
@@ -167,7 +265,85 @@ public:
     }
 };
 
-RestProvider WebCtlRestProvider{
+class Server
+{
+    asio::io_context &ioc_;
+
+    RestProvider &rest_provider_;
+
+    asio::ip::address addr_ = asio::ip::make_address("0.0.0.0");
+    unsigned short port_ = 6969;
+
+    tcp::acceptor acceptor_;
+    tcp::endpoint endpoint_{addr_, port_};
+
+    asio::awaitable<void> Session(beast::tcp_stream stream)
+    {
+        beast::flat_buffer buffer;
+        http::request<http::string_body> req{};
+
+        stream.expires_after(std::chrono::seconds(30));
+        co_await http::async_read(stream, buffer, req);
+
+        auto res = this->rest_provider_.RespondTo(req);
+
+        co_await beast::async_write(stream, std::move(res));
+
+        stream.socket().shutdown(tcp::socket::shutdown_send);
+    }
+
+    asio::awaitable<void> Listen()
+    {
+        beast::error_code ec;
+
+        this->acceptor_.open(this->endpoint_.protocol(), ec);
+        if (ec)
+        {
+            throw std::runtime_error("Failed to open acceptor!");
+        }
+
+        this->acceptor_.set_option(asio::socket_base::reuse_address(true));
+        this->acceptor_.bind(this->endpoint_, ec);
+        if (ec)
+        {
+            throw std::runtime_error("Failed to bind acceptor!");
+        }
+
+        this->acceptor_.listen(asio::socket_base::max_listen_connections, ec);
+        if (ec)
+        {
+            throw std::runtime_error("Failed to listen to acceptor!");
+        }
+
+        auto executor = co_await asio::this_coro::executor;
+
+        while (true)
+        {
+            beast::tcp_stream stream{co_await this->acceptor_.async_accept()};
+            asio::co_spawn(executor, this->Session(std::move(stream)), [](std::exception_ptr e) {
+                if (e)
+                {
+                    std::rethrow_exception(e);
+                }
+            });
+        }
+    }
+
+public:
+    Server(asio::io_context &ioc, RestProvider &rest_provider) : ioc_(ioc), acceptor_(asio::make_strand(ioc)), rest_provider_(rest_provider)
+    {
+        std::cout << "[Server] Initializing..." << std::endl;
+
+        asio::co_spawn(this->ioc_, this->Listen(), [](std::exception_ptr e) {
+            if (e)
+            {
+                std::rethrow_exception(e);
+            }
+        });
+    }
+};
+
+RestProvider web_ctl_rest_provider{
     // Request Logging
     Middleware{ "/", [](Request &req) -> std::optional<Response> {
         std::cout << "[Server] Received request to " << req.target() << std::endl;
@@ -190,7 +366,7 @@ RestProvider WebCtlRestProvider{
     }},
 
     // Routes
-    Node{ http::verb::get, "/info", [](Request const &req) -> Response {
+    Route{ http::verb::get, "/info", [](Request const &req) -> Response {
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.body() = "v0.0.1";
 
@@ -198,125 +374,32 @@ RestProvider WebCtlRestProvider{
     }},
 };
 
-class Session : public std::enable_shared_from_this<Session>
+int main(int argc, char const **argv)
 {
-    beast::tcp_stream stream_;
-    beast::flat_buffer buffer_;
-    http::request<http::string_body> req_;
+    // 0. Read and Initialize Config
+    // Load in ca certs
+    std::ifstream ca_certs{argv[1]};
+    std::string ca_string{std::istreambuf_iterator<char>{ca_certs}, {}};
 
-    void Close()
+    // Setup asio context
+    asio::io_context ioc;
+
+    HTTPClient client{ioc, ca_string};
+    JWKSProvider jwks_provider{ioc, client};
+    Server server{ioc, web_ctl_rest_provider};
+
+    // Launch threads
+    std::size_t thread_count = std::thread::hardware_concurrency();
+    std::vector<std::thread> threads;
+    threads.reserve(thread_count);
+    for (std::size_t i = 0; i < thread_count; i++)
     {
-        beast::error_code ec;
-        this->stream_.socket().shutdown(tcp::socket::shutdown_send, ec);
+        threads.emplace_back([&] {
+            ioc.run();
+        });
     }
 
-    void OnWrite(beast::error_code ec, std::size_t bytes)
-    {
-        this->Close();
-    }
-
-    void OnRead(beast::error_code ec, std::size_t bytes)
-    {
-        if (ec == http::error::end_of_stream)
-        {
-            this->Close();
-        }
-
-        if (ec)
-        {
-            throw std::runtime_error("HTTP read error!");
-        }
-
-        // Send Response
-        auto res = WebCtlRestProvider.RespondTo(this->req_);
-        beast::async_write(this->stream_, std::move(res), beast::bind_front_handler(&Session::OnWrite, this->shared_from_this()));
-    }
-
-    void Read()
-    {
-        this->req_ = {};
-        this->stream_.expires_after(std::chrono::seconds(30));
-        http::async_read(this->stream_, this->buffer_, this->req_, beast::bind_front_handler(&Session::OnRead, this->shared_from_this()));
-    }
-
-public:
-    void Run()
-    {
-        net::dispatch(this->stream_.get_executor(), beast::bind_front_handler(&Session::Read, this->shared_from_this()));
-    }
-
-    Session(tcp::socket &&socket) : stream_(std::move(socket)) {}
-};
-
-class Server : public std::enable_shared_from_this<Server>
-{
-    net::io_context &ioc_;
-    tcp::acceptor acceptor_;
-
-    net::ip::address addr_ = net::ip::make_address("0.0.0.0");
-    unsigned short port_ = 6969;
-
-    void OnAccept(beast::error_code ec, tcp::socket socket)
-    {
-        if (ec)
-        {
-            throw std::runtime_error("Failed to accept!");
-        }
-
-        auto session = std::make_shared<Session>(std::move(socket));
-        session->Run();
-
-        this->Accept();
-    }
-
-    void Accept()
-    {
-        this->acceptor_.async_accept(net::make_strand(this->ioc_), beast::bind_front_handler(&Server::OnAccept, this->shared_from_this()));
-    }
-
-public:
-    void Run()
-    {
-        this->Accept();
-        this->ioc_.run();
-    }
-
-    Server(net::io_context &ioc) : ioc_(ioc), acceptor_(net::make_strand(ioc))
-    {
-        beast::error_code ec;
-
-        tcp::endpoint endpoint{this->addr_, this->port_};
-
-        this->acceptor_.open(endpoint.protocol(), ec);
-        if (ec)
-        {
-            throw std::runtime_error("Failed to open acceptor!");
-        }
-
-        this->acceptor_.set_option(net::socket_base::reuse_address(true));
-        this->acceptor_.bind(endpoint, ec);
-        if (ec)
-        {
-            throw std::runtime_error("Failed to bind acceptor!");
-        }
-
-        this->acceptor_.listen(net::socket_base::max_listen_connections, ec);
-        if (ec)
-        {
-            throw std::runtime_error("Failed to listen to acceptor!");
-        }
-    }
-};
-
-int main()
-{
-    net::io_context ioc;
-
-    Client client{ioc};
-    client.Request("cognito-idp.us-east-1.amazonaws.com", "/us-east-1_zLcMyB1HE/.well-known/jwks.json");
-
-    auto server = std::make_shared<Server>(ioc);
-    server->Run();
+    ioc.run();
 
     return 0;
 }

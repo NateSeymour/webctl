@@ -5,8 +5,8 @@ set(CMAKE_CXX_STANDARD 23)
 
 include(cmake/CPM.cmake)
 
-find_package(OpenSSL REQUIRED)
+find_package(OpenSSL COMPONENTS SSL Crypto REQUIRED)
 CPMAddPackage("gh:boostorg/boost#boost-1.89.0")
 
 add_executable(webctl src/main.cpp)
-target_link_libraries(webctl PUBLIC Boost::beast Boost::asio openssl)
+target_link_libraries(webctl PUBLIC Boost::beast Boost::url Boost::asio Boost::json OpenSSL::SSL)
