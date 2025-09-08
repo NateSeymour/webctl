@@ -9,6 +9,7 @@
 #include <vector>
 #include <mutex>
 #include <boost/beast/core.hpp>
+#include <boost/beast/core/detail/base64.hpp>
 #include <boost/beast/http.hpp>
 #include <boost/beast/version.hpp>
 #include <boost/asio/strand.hpp>
@@ -19,8 +20,11 @@
 #include <boost/asio/detached.hpp>
 #include <boost/url.hpp>
 #include <boost/json.hpp>
+#include <boost/algorithm/string/split.hpp>
+#include <boost/algorithm/string/classification.hpp>
 
 namespace beast = boost::beast;
+namespace base64 = beast::detail::base64;
 namespace http = beast::http;
 namespace asio = boost::asio;
 namespace ssl = asio::ssl;
@@ -380,13 +384,40 @@ RestProvider<WebCtlContext> web_ctl_rest_provider{
     Middleware<WebCtlContext>{ "/", [](WebCtlContext &ctx, Request &req) -> std::optional<Response> {
         auto res_unauthorized = http::response<http::empty_body>{http::status::unauthorized, req.version()};
 
+        // Check for Authorization header
         auto auth_header = req.find(http::field::authorization);
         if (auth_header == req.end())
         {
             return res_unauthorized;
         }
 
+        // Parse token
         auto token = auth_header->value();
+
+        std::vector<std::string> token_parts;
+        token_parts.reserve(3);
+        boost::split(token_parts, token, boost::is_any_of("."));
+
+        if (token_parts.size() != 3)
+        {
+            return res_unauthorized;
+        }
+
+        std::vector<char> buffer(base64::decoded_size(token.size()), '\0');
+
+        auto [header_size, header_read] = base64::decode(buffer.data(), token_parts[0].c_str(), token_parts[0].size());
+        auto header = json::parse(std::string_view{buffer.data(), header_size});
+
+        auto [claims_size, claims_read] = base64::decode(buffer.data(), token_parts[1].c_str(), token_parts[1].size());
+        auto claims = json::parse(std::string_view{buffer.data(), claims_size});
+
+        auto sig = token_parts[2];
+
+        auto key = ctx.jwks_provider.GetKeyById(header.as_object()["kid"].as_string().data());
+        if (!key)
+        {
+            return res_unauthorized;
+        }
 
         return std::nullopt;
     }},
