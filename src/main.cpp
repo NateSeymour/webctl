@@ -419,6 +419,28 @@ RestProvider<WebCtlContext> web_ctl_rest_provider{
             return res_unauthorized;
         }
 
+        // Verify signature
+        EVP_MD_CTX *md_ctx = EVP_MD_CTX_create();
+
+        EVP_MD const *md = EVP_get_digestbyname("SHA256");
+        if (!md)
+        {
+            EVP_MD_CTX_free(md_ctx);
+            return res_unauthorized;
+        }
+
+        EVP_VerifyInit(md_ctx, md);
+
+        EVP_VerifyUpdate(md_ctx, token_parts[1].c_str(), token_parts[1].size());
+        bool valid = EVP_VerifyFinal(md_ctx, reinterpret_cast<unsigned char const *>(token_parts[2].c_str()), token_parts[2].size(), nullptr);
+
+        EVP_MD_CTX_free(md_ctx);
+
+        if (!valid)
+        {
+            return res_unauthorized;
+        }
+
         return std::nullopt;
     }},
 
