@@ -379,6 +379,12 @@ namespace sdbus
         return msg;
     }
 
+    sdbus::Message &operator>>(sdbus::Message &msg, json::string &array) { return msg; }
+
+    sdbus::Message &operator>>(sdbus::Message &msg, json::string &object) { return msg; }
+
+    sdbus::Message &operator>>(sdbus::Message &msg, json::string &string) { return msg; }
+
     sdbus::Message &operator>>(sdbus::Message &msg, json::value &item)
     {
         auto [type, contents] = msg.peekType();
@@ -387,6 +393,13 @@ namespace sdbus
         {
             case 's':
             {
+                msg >> item.as_string();
+                break;
+            }
+
+            case 's':
+            {
+                msg >> item.as_array();
                 break;
             }
         }
@@ -519,23 +532,25 @@ RestProvider<WebCtlContext> web_ctl_rest_provider{
      * Body: JSON
      * { "method": string, "args": any }
      */
-    Route<WebCtlContext>{ http::verb::post, "/ctl", [](WebCtlContext &ctx, Request const &req) -> Response {
+    Route<WebCtlContext>{ http::verb::post, "/systemd", [](WebCtlContext &ctx, Request const &req) -> Response {
         http::response<http::string_body> res{http::status::ok, req.version()};
 
         sdbus::ServiceName destination{"org.freedesktop.systemd1"};
-        sdbus::ObjectPath objectPath{"/org/freedesktop/systemd1"};
+        sdbus::ObjectPath object_path{"/org/freedesktop/systemd1"};
 
-        auto proxy = sdbus::createProxy(std::move(destination), std::move(objectPath));
+        auto proxy = sdbus::createProxy(std::move(destination), std::move(object_path));
 
-        sdbus::InterfaceName interfaceName{"org.freedesktop.systemd1.Manager"};
+        sdbus::InterfaceName interface_name{"org.freedesktop.systemd1.Manager"};
 
-        sdbus::MethodName concatenate{"ListUnits"};
+        sdbus::MethodName method_name{"ListUnits"};
 
-        auto method = proxy->createMethodCall(interfaceName, concatenate);
+        auto method = proxy->createMethodCall(interface_name, method_name);
         auto reply = proxy->callMethod(method);
 
-        std::vector<sdbus::Struct<std::string, std::string, std::string, std::string, std::string, std::string, sdbus::ObjectPath, std::uint32_t, std::string, sdbus::ObjectPath>> reply_deserialized;
-        reply >> reply_deserialized;
+        json::value reply_json;
+        reply >> reply_json;
+
+        res.body() = reply_json;
 
         return res;
     }},
