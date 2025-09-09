@@ -25,6 +25,7 @@
 #include <openssl/err.h>
 #include <openssl/param_build.h>
 #include <cppcodec/base64_url_unpadded.hpp>
+#include <sdbus-c++/sdbus-c++.h>
 
 namespace beast = boost::beast;
 namespace http = beast::http;
@@ -371,6 +372,29 @@ public:
     }
 };
 
+namespace sdbus
+{
+    sdbus::Message &operator<<(sdbus::Message &msg, json::value const &item)
+    {
+        return msg;
+    }
+
+    sdbus::Message &operator>>(sdbus::Message &msg, json::value &item)
+    {
+        auto [type, contents] = msg.peekType();
+
+        switch (type)
+        {
+            case 's':
+            {
+                break;
+            }
+        }
+
+        return msg;
+    }
+}
+
 struct WebCtlContext
 {
     JWKSProvider &jwks_provider;
@@ -486,6 +510,32 @@ RestProvider<WebCtlContext> web_ctl_rest_provider{
     Route<WebCtlContext>{ http::verb::get, "/info", [](WebCtlContext &ctx, Request const &req) -> Response {
         http::response<http::string_body> res{http::status::ok, req.version()};
         res.body() = "v0.0.1";
+
+        return res;
+    }},
+
+    /*
+     * POST /ctl
+     * Body: JSON
+     * { "method": string, "args": any }
+     */
+    Route<WebCtlContext>{ http::verb::post, "/ctl", [](WebCtlContext &ctx, Request const &req) -> Response {
+        http::response<http::string_body> res{http::status::ok, req.version()};
+
+        sdbus::ServiceName destination{"org.freedesktop.systemd1"};
+        sdbus::ObjectPath objectPath{"/org/freedesktop/systemd1"};
+
+        auto proxy = sdbus::createProxy(std::move(destination), std::move(objectPath));
+
+        sdbus::InterfaceName interfaceName{"org.freedesktop.systemd1.Manager"};
+
+        sdbus::MethodName concatenate{"ListUnits"};
+
+        auto method = proxy->createMethodCall(interfaceName, concatenate);
+        auto reply = proxy->callMethod(method);
+
+        std::vector<sdbus::Struct<std::string, std::string, std::string, std::string, std::string, std::string, sdbus::ObjectPath, std::uint32_t, std::string, sdbus::ObjectPath>> reply_deserialized;
+        reply >> reply_deserialized;
 
         return res;
     }},
