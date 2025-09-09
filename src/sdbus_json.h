@@ -6,6 +6,8 @@
 
 namespace sdbus
 {
+    namespace json = boost::json;
+    
     sdbus::Message &operator<<(sdbus::Message &msg, json::value const &item)
     {
         return msg;

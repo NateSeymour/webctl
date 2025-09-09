@@ -1,8 +1,20 @@
 #ifndef REST_PROVIDER_H
 #define REST_PROVIDER_H
 
+#include <string>
+#include <string_view>
+#include <vector>
+#include <variant>
+#include <initializer_list>
+#include <unordered_map>
+#include <ranges>
+#include <boost/beast.hpp>
+#include "overload.h"
+
 namespace webctl
 {
+    namespace http = boost::beast::http;
+
     using Response = http::message_generator;
     using Request = http::request<http::string_body>;
 

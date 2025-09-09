@@ -2,9 +2,20 @@
 #define JWKS_PROVIDER_H
 
 #include <string_view>
+#include <mutex>
+#include <optional>
+#include <iostream>
+#include <expected>
+#include <boost/asio.hpp>
+#include <boost/json.hpp>
+#include <boost/url.hpp>
+#include "HTTPClient.h"
 
 namespace webctl
 {
+    namespace asio = boost::asio;
+    namespace json = boost::json;
+
     struct JWKS
     {
         std::unordered_map<std::string, json::value> keys;
@@ -79,9 +90,16 @@ namespace webctl
         }
     };
 
+    enum class JWTError
+    {
+        Malformed,
+        Invalid,
+        NoKey,
+    };
+
     struct JWT
     {
-        static JWT FromToken(std::string_view token);
+        static std::expected<JWT, JWTError> FromToken(JWKSProvider &jwks_provider, std::string_view token);
     };
 } // namespace webctl
 

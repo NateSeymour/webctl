@@ -1,8 +1,19 @@
 #ifndef HTTP_CLIENT_H
 #define HTTP_CLIENT_H
 
+#include <boost/asio.hpp>
+#include <boost/asio/ssl.hpp>
+#include <boost/beast.hpp>
+#include <boost/url.hpp>
+
 namespace webctl
 {
+    namespace asio = boost::asio;
+    namespace beast = boost::beast;
+    namespace ssl = asio::ssl;
+    namespace http = beast::http;
+    using tcp = asio::ip::tcp;
+
     class HTTPClient
     {
         asio::io_context &ioc_;

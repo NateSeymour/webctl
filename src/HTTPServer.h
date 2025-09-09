@@ -1,8 +1,16 @@
 #ifndef HTTP_SERVER_H
 #define HTTP_SERVER_H
 
+#include <boost/asio.hpp>
+#include <boost/beast.hpp>
+#include "RestProvider.h"
+
 namespace webctl
 {
+    namespace asio = boost::asio;
+    namespace beast = boost::beast;
+    using tcp = asio::ip::tcp;
+
     template<typename RestContextType>
     class HTTPServer
     {
@@ -70,7 +78,7 @@ namespace webctl
         }
 
     public:
-        Server(asio::io_context &ioc, RestProvider<RestContextType> &rest_provider, RestContextType &rest_ctx) : ioc_(ioc), acceptor_(asio::make_strand(ioc)), rest_provider_(rest_provider), rest_ctx_(rest_ctx)
+        HTTPServer(asio::io_context &ioc, RestProvider<RestContextType> &rest_provider, RestContextType &rest_ctx) : ioc_(ioc), acceptor_(asio::make_strand(ioc)), rest_provider_(rest_provider), rest_ctx_(rest_ctx)
         {
             std::cout << "[Server] Initializing..." << std::endl;
 

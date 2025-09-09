@@ -10,5 +10,12 @@ CPMAddPackage("gh:boostorg/boost#boost-1.89.0")
 CPMAddPackage("gh:Kistler-Group/sdbus-cpp@2.1.0")
 CPMAddPackage("gh:tplgy/cppcodec#master")
 
-add_executable(webctl src/main.cpp)
-target_link_libraries(webctl PUBLIC Boost::beast Boost::url Boost::asio Boost::json Boost::algorithm Boost::iterator OpenSSL::SSL sdbus-c++ cppcodec)
+add_executable(
+    webctl 
+    src/main.cpp
+    src/JwksProvider.cpp
+)
+target_link_libraries(
+    webctl 
+    PUBLIC Boost::beast Boost::url Boost::asio Boost::json Boost::algorithm Boost::iterator OpenSSL::SSL sdbus-c++ cppcodec
+)
