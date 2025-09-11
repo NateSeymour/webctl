@@ -2,10 +2,12 @@
 #include <iostream>
 #include <thread>
 #include <functional>
-#include <sdbus-c++/sdbus-c++.h>
+#include <filesystem>
 #include <boost/beast.hpp>
 #include <boost/json.hpp>
 #include <boost/asio.hpp>
+#include <sdbus-c++/sdbus-c++.h>
+#include <toml++/toml.hpp>
 #include "HTTPClient.h"
 #include "OIDCProvider.h"
 #include "HTTPServer.h"
@@ -82,18 +84,77 @@ http::response<http::string_body> request_handler(OIDCProvider &oidc_provider, h
     return res;
 }
 
+struct WebctlConfig
+{
+    std::filesystem::path ca_cert_path = "/etc/ssl/certs/ca-certificates.crt";
+    std::string oidc_authority;
+
+    [[nodiscard]] static WebctlConfig LoadFromSystem()
+    {
+        WebctlConfig config{};
+
+        std::filesystem::path const search_paths[] = {
+            "/etc/webctl.toml",
+            "/usr/local/etc/webctl.toml",
+            "./webctl.toml",
+        };
+
+        for (auto const &path : search_paths)
+        {
+            try
+            {
+                toml::table table = toml::parse_file(path.c_str());
+
+                auto webctl = table["webctl"];
+                if (!webctl) continue;
+
+                if (auto ca_cert_path = webctl["ca_cert_path"].value<std::string_view>(); ca_cert_path)
+                {
+                    config.ca_cert_path = ca_cert_path.value();
+                }
+
+                if (auto oidc_authority = webctl["oidc_authority"].value<std::string_view>(); oidc_authority)
+                {
+                    config.oidc_authority = oidc_authority.value();
+                }
+
+                std::cout << "[Config] Loaded config from " << path << std::endl;
+            }
+            catch (std::exception &e)
+            {
+                std::cerr << "[Config] Unable to load config from " << path << std::endl;
+            }
+        }
+
+        return std::move(config);
+    }
+};
+
 int main(int argc, char const **argv)
 {
-    // 0. Read and Initialize Config
+    auto config = WebctlConfig::LoadFromSystem();
+
+    if (config.ca_cert_path.empty())
+    {
+        std::cerr << "[Main] Invalid path to CA Certificates" << std::endl;
+        return 1;
+    }
+
+    if (config.oidc_authority.empty())
+    {
+        std::cerr << "[Main] Invalid OIDC Authority" << std::endl;
+        return 1;
+    }
+
     // Load in ca certs
-    std::ifstream ca_certs{"/etc/ssl/certs/ca-certificates.crt"};
+    std::ifstream ca_certs{config.ca_cert_path};
     std::string ca_string{std::istreambuf_iterator<char>{ca_certs}, {}};
 
     // Setup asio context
     asio::io_context ioc;
 
     HTTPClient client{ioc, ca_string};
-    OIDCProvider oidc_provider{ioc, client, boost::url{"https://cognito-idp.us-east-1.amazonaws.com/us-east-1_zLcMyB1HE/.well-known/jwks.json"}};
+    OIDCProvider oidc_provider{ioc, client, boost::url{config.oidc_authority}};
     HTTPServer server{ioc, std::bind(request_handler, std::ref(oidc_provider), std::placeholders::_1)};
 
     // Launch threads

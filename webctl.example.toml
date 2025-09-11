@@ -1,0 +1,4 @@
+[webctl]
+
+ca_cert_path = "/etc/ssl/certs/ca-certificates.crt"
+oidc_authority = "https://oidc.authority.com/.well-known/jwks.json"

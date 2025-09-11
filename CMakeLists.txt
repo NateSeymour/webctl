@@ -10,6 +10,7 @@ find_package(OpenSSL COMPONENTS SSL Crypto REQUIRED)
 find_package(Boost 1.89.0 COMPONENTS beast url asio json algorithm iterator REQUIRED)
 CPMAddPackage("gh:Kistler-Group/sdbus-cpp@2.1.0")
 CPMAddPackage("gh:tplgy/cppcodec#master")
+CPMAddPackage("gh:marzer/tomlplusplus@3.4.0")
 
 add_executable(
         webctl
@@ -20,5 +21,5 @@ add_executable(
 )
 target_link_libraries(
         webctl
-        PUBLIC Boost::beast Boost::url Boost::asio Boost::json Boost::algorithm Boost::iterator OpenSSL::SSL sdbus-c++ cppcodec
+        PUBLIC Boost::beast Boost::url Boost::asio Boost::json Boost::algorithm Boost::iterator OpenSSL::SSL sdbus-c++ cppcodec tomlplusplus::tomlplusplus
 )
