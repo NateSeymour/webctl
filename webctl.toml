@@ -1,6 +1,0 @@
-[auth]
-
-
-[ssl]
-ssl_ca_pem = "/path/to/cacert.pem"
-
