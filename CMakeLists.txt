@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28)
-project(webctl)
+project(webctl VERSION 0.0.1)
 
 set(CMAKE_CXX_STANDARD 23)
 
@@ -23,3 +23,6 @@ target_link_libraries(
         webctl
         PUBLIC Boost::beast Boost::url Boost::asio Boost::json Boost::algorithm Boost::iterator OpenSSL::SSL sdbus-c++ cppcodec tomlplusplus::tomlplusplus
 )
+
+install(TARGETS webctl)
+install(FILES webctl.example.toml TYPE SYSCONF RENAME webctl.toml)
