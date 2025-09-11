@@ -1,4 +1,4 @@
-#include "JwksProvider.h"
+#include "OIDCProvider.h"
 #include <boost/algorithm/string/split.hpp>
 #include <boost/algorithm/string/classification.hpp>
 #include <openssl/evp.h>
@@ -10,7 +10,59 @@ using base64 = cppcodec::base64_url_unpadded;
 
 using namespace webctl;
 
-std::expected<JWT, JWTError> JWT::FromToken(JWKSProvider &jwks_provider, std::string_view token)
+std::optional<JWKS> JWKS::FromJson(json::value raw)
+{
+    JWKS jwks;
+
+    auto &keys = raw.as_object()["keys"];
+    for (auto &key : keys.as_array())
+    {
+        auto &kid = key.as_object()["kid"].as_string();
+
+        jwks.keys[std::string{kid}] = key;
+    }
+
+    return std::move(jwks);
+}
+
+asio::awaitable<void> OIDCProvider::FetchJWKS()
+{
+    while (true)
+    {
+        std::cout << "[OIDCProvider] Fetching latest JWKS..." << std::endl;
+        auto res = co_await this->http_client_.RequestAsync(boost::url{this->authority_});
+
+        json::value jwks = json::parse(beast::buffers_to_string(res.body().data()));
+
+        {
+            std::lock_guard lk(this->m_jwks_);
+
+            this->jwks_ = JWKS::FromJson(jwks).value();
+
+            std::cout << "[OIDCProvider] Fetched latest JWKS. " << this->jwks_.keys.size() << " keys loaded:" << std::endl;
+            for (auto const &[id, key] : this->jwks_.keys)
+            {
+                std::cout << "[OIDCProvider] - " << id << std::endl;
+            }
+        }
+
+        co_await asio::steady_timer{this->ioc_, std::chrono::minutes(10)}.async_wait();
+    }
+}
+
+std::optional<json::value> OIDCProvider::GetKeyById(std::string const &kid)
+{
+    std::lock_guard lk(this->m_jwks_);
+
+    if (this->jwks_.keys.contains(kid))
+    {
+        return this->jwks_.keys.at(kid);
+    }
+
+    return std::nullopt;
+}
+
+std::expected<JWT, JWTError> OIDCProvider::ValidateToken(std::string_view token)
 {
     JWT jwt{};
 
@@ -33,7 +85,7 @@ std::expected<JWT, JWTError> JWT::FromToken(JWKSProvider &jwks_provider, std::st
     std::string payload = token_parts[0] + "." + token_parts[1];
     auto sig = base64::decode(token_parts[2]);
 
-    auto key = jwks_provider.GetKeyById(header.as_object()["kid"].as_string().data());
+    auto key = this->GetKeyById(header.as_object()["kid"].as_string().data());
     if (!key)
     {
         return std::unexpected{JWTError::NoKey};
@@ -91,4 +143,14 @@ std::expected<JWT, JWTError> JWT::FromToken(JWKSProvider &jwks_provider, std::st
     OSSL_PARAM_BLD_free(param_bld);
     OSSL_PARAM_free(params);
     EVP_MD_CTX_free(md_ctx);
+
+    return jwt;
+}
+
+OIDCProvider::OIDCProvider(asio::io_context &ioc, HTTPClient &http_client, boost::url authority) : ioc_(ioc), http_client_(http_client), authority_(std::move(authority))
+{
+    std::cout << "[OIDCProvider] Initializing..." << std::endl;
+    std::cout << "[OIDCProvider] Authority: " << this->authority_ << std::endl;
+
+    asio::co_spawn(this->ioc_, this->FetchJWKS(), asio::detached);
 }

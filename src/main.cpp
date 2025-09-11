@@ -1,14 +1,13 @@
 #include <fstream>
 #include <iostream>
-#include <optional>
 #include <thread>
+#include <functional>
 #include <sdbus-c++/sdbus-c++.h>
 #include <boost/beast.hpp>
 #include <boost/json.hpp>
 #include <boost/asio.hpp>
 #include "HTTPClient.h"
-#include "JwksProvider.h"
-#include "RestProvider.h"
+#include "OIDCProvider.h"
 #include "HTTPServer.h"
 #include "sdbus_json.h"
 
@@ -18,71 +17,70 @@ namespace asio = boost::asio;
 
 using namespace webctl;
 
-struct WebCtlContext
+http::response<http::string_body> request_handler(OIDCProvider &oidc_provider, http::request<http::string_body> const &req)
 {
-    JWKSProvider &jwks_provider;
-};
+    http::response<http::string_body> res{};
+    std::error_code ec;
 
-RestProvider<WebCtlContext> web_ctl_rest_provider{
-    // Request Logging
-    Middleware<WebCtlContext>{ "/", [](WebCtlContext &ctx, Request &req) -> std::optional<Response> {
-        std::cout << "[Server] Received request to " << req.target() << std::endl;
-        return std::nullopt;
-    }},
-
-    // Authentication
-    Middleware<WebCtlContext>{ "/", [](WebCtlContext &ctx, Request &req) -> std::optional<Response> {
-        auto res_unauthorized = http::response<http::empty_body>{http::status::unauthorized, req.version()};
-
-        // Check for Authorization header
-        auto auth_header = req.find(http::field::authorization);
-        if (auth_header == req.end())
-        {
-            return res_unauthorized;
-        }
-
-        auto token = auth_header->value();
-        auto jwt = JWT::FromToken(ctx.jwks_provider, token);
-
-        return std::nullopt;
-    }},
-
-    // Routes
-    Route<WebCtlContext>{ http::verb::get, "/info", [](WebCtlContext &ctx, Request const &req) -> Response {
-        http::response<http::string_body> res{http::status::ok, req.version()};
-        res.body() = "v0.0.1";
-
+    // Check for Authorization header
+    auto auth_header = req.find(http::field::authorization);
+    if (auth_header == req.end())
+    {
+        res.result(http::status::unauthorized);
+        res.body() = json::serialize(json::object{
+            {"error", "Missing Authorization Header"},
+        });
         return res;
-    }},
+    }
 
-    /*
-     * POST /ctl
-     * Body: JSON
-     * { "method": string, "args": any }
-     */
-    Route<WebCtlContext>{ http::verb::post, "/systemd", [](WebCtlContext &ctx, Request const &req) -> Response {
-        http::response<http::string_body> res{http::status::ok, req.version()};
+    auto token = auth_header->value();
+    auto jwt = oidc_provider.ValidateToken(token);
 
-        sdbus::ServiceName destination{"org.freedesktop.systemd1"};
-        sdbus::ObjectPath object_path{"/org/freedesktop/systemd1"};
-
-        auto proxy = sdbus::createProxy(std::move(destination), std::move(object_path));
-
-        sdbus::InterfaceName interface_name{"org.freedesktop.systemd1.Manager"};
-
-        sdbus::MethodName method_name{"ListUnits"};
-
-        auto method = proxy->createMethodCall(interface_name, method_name);
-        auto reply = proxy->callMethod(method);
-
-        json::value reply_json;
-        reply >> reply_json;
-
-        res.body() = json::serialize(reply_json);
-
+    if (!jwt)
+    {
+        res.result(http::status::unauthorized);
+        res.body() = json::serialize(json::object{
+            {"error", "Invalid Authorization Token"},
+            {"code", static_cast<int>(jwt.error())},
+        });
         return res;
-    }},
-};
+    }
+
+    // Process Request
+    boost::url endpoint{req.target()};
+    auto service = endpoint.segments().front();
+
+    json::value body = json::parse(req.body(), ec);
+    if (ec)
+    {
+        res.result(http::status::bad_request);
+        res.body() = json::serialize(json::object{
+            {"error", "Malformed Request"},
+            {"message", ec.message()},
+        });
+        return res;
+    }
+
+    sdbus::ServiceName destination{service};
+    sdbus::ObjectPath object_path{body.as_object()["object"].as_string().c_str()};
+
+    auto proxy = sdbus::createProxy(std::move(destination), std::move(object_path));
+
+    sdbus::InterfaceName interface_name{body.as_object()["interface"].as_string().c_str()};
+
+    sdbus::MethodName method_name{body.as_object()["method"].as_string().c_str()};
+
+    auto method = proxy->createMethodCall(interface_name, method_name);
+    auto reply = proxy->callMethod(method);
+
+    json::value reply_json;
+    reply >> reply_json;
+
+    res.result(http::status::ok);
+    res.body() = json::serialize(reply_json);
+
+    return res;
+}
 
 int main(int argc, char const **argv)
 {
@@ -95,12 +93,8 @@ int main(int argc, char const **argv)
     asio::io_context ioc;
 
     HTTPClient client{ioc, ca_string};
-    JWKSProvider jwks_provider{ioc, client};
-
-    WebCtlContext webctl_ctx{
-        .jwks_provider = jwks_provider,
-    };
-    HTTPServer server{ioc, web_ctl_rest_provider, webctl_ctx};
+    OIDCProvider oidc_provider{ioc, client, boost::url{"https://cognito-idp.us-east-1.amazonaws.com/us-east-1_zLcMyB1HE/.well-known/jwks.json"}};
+    HTTPServer server{ioc, std::bind(request_handler, std::ref(oidc_provider), std::placeholders::_1)};
 
     // Launch threads
     std::size_t thread_count = std::thread::hardware_concurrency();
